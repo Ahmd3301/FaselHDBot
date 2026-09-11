@@ -78,14 +78,23 @@ jobs:
           [ -x ~/tools-cf/cloudflared ] || curl -sL -o ~/tools-cf/cloudflared \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x ~/tools-cf/cloudflared
-          nohup ~/tools-cf/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8000 > tunnel.log 2>&1 &
           URL=""
-          for i in $(seq 1 30); do
-            URL=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
-            [ -n "$URL" ] && break
-            sleep 4
+          for round in 1 2 3; do
+            pkill -f "cloudflared tunnel" 2>/dev/null || true
+            # الجولة 1: QUIC الافتراضي، الجولات التالية: http2 (TCP) عند حجب UDP
+            PROTO=""
+            [ "$round" = "1" ] || PROTO="--protocol http2"
+            # shellcheck disable=SC2086
+            nohup ~/tools-cf/cloudflared tunnel --no-autoupdate $PROTO --url http://127.0.0.1:8000 > tunnel.log 2>&1 &
+            for i in $(seq 1 25); do
+              URL=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
+              [ -n "$URL" ] && break 2
+              sleep 4
+            done
+            echo "tunnel round $round failed, retrying…"; tail -5 tunnel.log || true
+            sleep 10
           done
-          [ -n "$URL" ] || { echo "tunnel failed"; tail -20 tunnel.log; exit 1; }
+          [ -n "$URL" ] || { echo "tunnel failed 3x"; tail -20 tunnel.log; exit 1; }
           echo "TUNNEL_URL=$URL"
           echo "$URL" > api-url.txt
 
