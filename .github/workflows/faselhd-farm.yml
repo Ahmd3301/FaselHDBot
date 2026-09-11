@@ -1,0 +1,434 @@
+name: FaselHD Farm (main + 4 workers)
+
+# مزرعة 5 Runners في job واحدة (5 ساعات/دورة):
+#  main: بوت @Videoplayeronlinebot + Redis + API + Quick Tunnel (رابطه يُكتب في رسالة 13)
+#  w1..w4: عمال، كل عامل ببوته وتوكنه وسيرفره، يأخذ المهام من الـ API
+# الأسرار: MAIN_TOKEN=TELEGRAM_BOT_TOKEN, TG_W1..W4_TOKEN, API_ID/HASH, CHAT_ID
+# عند نهاية الدورة: dump.rdb يُحفظ (artifact + رسالة 12) وتُشغَّل دورة جديدة ذاتياً.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_minutes:
+        description: 'Main bot runtime in minutes (debug: use 25)'
+        required: false
+        default: '290'
+        type: string
+      auto_cycle:
+        description: 'Self-retrigger next cycle at end'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  actions: write
+
+# منع دورتين متوازيتين أبداً (مثيل واحد للبوت الرئيسي)
+concurrency:
+  group: faselhd-farm-singleton
+  cancel-in-progress: false
+
+env:
+  CHANNEL_ID: '-1003864899881'
+
+jobs:
+  main:
+    name: Main bot + API (Runner 01)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install redis-server
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq redis-server curl jq
+          redis-server --version
+
+      - name: Restore redis dump (previous cycle)
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/redisdata
+          RID=$(gh api repos/${{ github.repository }}/actions/workflows/faselhd-farm.yml/runs \
+            --jq '[.workflow_runs[] | select(.conclusion=="success")][0].id' -R ${{ github.repository }} 2>/dev/null || true)
+          if [ -n "$RID" ] && [ "$RID" != "null" ]; then
+            gh run download "$RID" -n redis-dump -D /tmp/redisdata -R ${{ github.repository }} 2>&1 | tail -1 || true
+          else echo "no previous successful cycle (fresh Redis)"; fi
+          ls -la /tmp/redisdata 2>/dev/null || true
+
+      - name: Start redis
+        run: |
+          redis-server --port 6379 --dir /tmp/redisdata --dbfilename dump.rdb --daemonize yes --save '900 1'
+          sleep 2
+          redis-cli ping
+
+      - name: Restore cloudflared cache
+        id: cf-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/tools-cf
+          key: Linux-cloudflared-v1
+
+      - name: Setup cloudflared + Quick Tunnel
+        run: |
+          mkdir -p ~/tools-cf
+          [ -x ~/tools-cf/cloudflared ] || curl -sL -o ~/tools-cf/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x ~/tools-cf/cloudflared
+          nohup ~/tools-cf/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8000 > tunnel.log 2>&1 &
+          URL=""
+          for i in $(seq 1 30); do
+            URL=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
+            [ -n "$URL" ] && break
+            sleep 4
+          done
+          [ -n "$URL" ] || { echo "tunnel failed"; tail -20 tunnel.log; exit 1; }
+          echo "TUNNEL_URL=$URL"
+          echo "$URL" > api-url.txt
+
+      - name: Publish api-url artifact (workers rendezvous)
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-url
+          path: api-url.txt
+          retention-days: 1
+
+      - name: Run main bot
+        timeout-minutes: 295
+        run: |
+          SECS=$((${{ inputs.runtime_minutes }} * 60))
+          REPO_DIR="$PWD" API_PUBLIC_URL="$(cat api-url.txt)" MAIN_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}" \
+          CHANNEL_ID="${{ env.CHANNEL_ID }}" PORT=8000 MAX_RUNTIME_S=$SECS \
+          timeout ${SECS}s python3 farm/main_bot.py | tee main-bot.log
+        env:
+          MAIN_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+      - name: Backup dump.rdb (artifact + message 12)
+        if: always()
+        run: |
+          redis-cli BGSAVE || true; sleep 5
+          ls -la /tmp/redisdata/dump.rdb || echo "no dump"
+          python3 - <<'PY'
+          import json, os, uuid, urllib.parse, urllib.request
+          tok = os.environ['MAIN_TOKEN']
+          p = '/tmp/redisdata/dump.rdb'
+          if os.path.exists(p) and os.path.getsize(p) > 100:
+              bound = uuid.uuid4().hex
+              def part(name, value):
+                  return (f'--{bound}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n').encode()
+              body = part('chat_id', os.environ['CHAT']) + part('message_id', '12')
+              body += (f'--{bound}\r\nContent-Disposition: form-data; name="media"\r\n\r\n'
+                       + json.dumps({"type": "document", "media": "attach://dump"}) + '\r\n').encode()
+              body += (f'--{bound}\r\nContent-Disposition: form-data; name="dump"; filename="dump.rdb"\r\n'
+                       + 'Content-Type: application/octet-stream\r\n\r\n').encode()
+              with open(p, 'rb') as f:
+                  payload = body + f.read() + f'\r\n--{bound}--\r\n'.encode()
+              req = urllib.request.Request(f'https://api.telegram.org/bot{tok}/editMessageMedia', data=payload,
+                                           headers={'Content-Type': f'multipart/form-data; boundary={bound}'})
+              try:
+                  r = urllib.request.urlopen(req, timeout=300).read().decode()
+                  print('MSG12 edit: ' + r[:200])
+              except Exception as e:
+                  print('MSG12 edit failed: ' + str(e)[:300])
+          else:
+              print('no dump to backup')
+          PY
+        env:
+          MAIN_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ env.CHANNEL_ID }}
+
+      - name: Upload redis dump artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: redis-dump
+          path: /tmp/redisdata/dump.rdb
+          if-no-files-found: warn
+          retention-days: 90
+
+  w1:
+    name: Worker 01 (Runner 02)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Restore tools cache
+        uses: actions/cache@v4
+        with:
+          path: ~/tools
+          key: Linux-tools-nm3u8dlre-ffmpegstatic-v2
+          restore-keys: |
+            Linux-tools-
+      - name: Restore Bot API image cache
+        uses: actions/cache@v4
+        with:
+          path: ~/docker-cache
+          key: Linux-docker-tgbotapi-v1
+          restore-keys: |
+            Linux-docker-tgbotapi-
+      - name: Setup tools + image
+        run: |
+          mkdir -p ~/tools ~/docker-cache
+          if [ ! -x "$HOME/tools/N_m3u8DL-RE" ]; then
+            ASSET=$(curl -sL https://api.github.com/repos/nilaoda/N_m3u8DL-RE/releases/latest \
+              | jq -r '.assets[] | select(.name | test("linux-x64.*\\.tar\\.gz$")) | .browser_download_url' | head -1)
+            curl -sL -o /tmp/nm.tar.gz "$ASSET" && tar xzf /tmp/nm.tar.gz -C "$HOME/tools" && chmod +x "$HOME/tools/N_m3u8DL-RE"
+          fi
+          if [ ! -x "$HOME/tools/ffmpeg" ]; then
+            curl -sL -o /tmp/ff.tar.xz "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+            tar xJf /tmp/ff.tar.xz -C /tmp && cp /tmp/ffmpeg-*-amd64-static/ffmpeg /tmp/ffmpeg-*-amd64-static/ffprobe "$HOME/tools/" && chmod +x "$HOME/tools/ffmpeg" "$HOME/tools/ffprobe"
+          fi
+          echo "$HOME/tools" >> "$GITHUB_PATH"
+          if docker image inspect aiogram/telegram-bot-api:latest >/dev/null 2>&1; then echo IMG=present;
+          elif [ -f "$HOME/docker-cache/tgbotapi.tar" ]; then docker load -i "$HOME/docker-cache/tgbotapi.tar" >/dev/null && echo IMG=cache;
+          else docker pull aiogram/telegram-bot-api:latest && docker save -o "$HOME/docker-cache/tgbotapi.tar" aiogram/telegram-bot-api:latest && echo IMG=pulled; fi
+      - name: Start worker Bot API server
+        run: |
+          docker run -d --name tgbotapi -p 8081:8081 \
+            -e TELEGRAM_API_ID="${{ secrets.TELEGRAM_API_ID }}" \
+            -e TELEGRAM_API_HASH="${{ secrets.TELEGRAM_API_HASH }}" \
+            -e TELEGRAM_LOCAL=1 \
+            aiogram/telegram-bot-api:latest --local >/dev/null
+          for i in $(seq 1 30); do
+            curl -s -o /dev/null "http://127.0.0.1:8081/bot${{ secrets.TG_W1_TOKEN }}/getMe" && break
+            sleep 2
+          done
+          echo WORKER_API_READY
+      - name: Run worker (up to 290 min)
+        timeout-minutes: 295
+        run: |
+          export PATH="$HOME/tools:$PATH"
+          SECS=$((${{ inputs.runtime_minutes }} * 60))
+          REPO_DIR="$PWD" WORKER_NAME=w1 WORKER_TOKEN="${{ secrets.TG_W1_TOKEN }}" \
+          CHANNEL_ID="${{ env.CHANNEL_ID }}" \
+          timeout ${SECS}s python3 farm/worker.py | tee worker-w1.log
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop tgbotapi 2>/dev/null || true; docker rm tgbotapi 2>/dev/null || true
+          rm -rf /tmp/farm_* /tmp/apiurl
+
+  w2:
+    name: Worker 02 (Runner 03)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Restore tools cache
+        uses: actions/cache@v4
+        with:
+          path: ~/tools
+          key: Linux-tools-nm3u8dlre-ffmpegstatic-v2
+          restore-keys: |
+            Linux-tools-
+      - name: Restore Bot API image cache
+        uses: actions/cache@v4
+        with:
+          path: ~/docker-cache
+          key: Linux-docker-tgbotapi-v1
+          restore-keys: |
+            Linux-docker-tgbotapi-
+      - name: Setup tools + image
+        run: |
+          mkdir -p ~/tools ~/docker-cache
+          if [ ! -x "$HOME/tools/N_m3u8DL-RE" ]; then
+            ASSET=$(curl -sL https://api.github.com/repos/nilaoda/N_m3u8DL-RE/releases/latest \
+              | jq -r '.assets[] | select(.name | test("linux-x64.*\\.tar\\.gz$")) | .browser_download_url' | head -1)
+            curl -sL -o /tmp/nm.tar.gz "$ASSET" && tar xzf /tmp/nm.tar.gz -C "$HOME/tools" && chmod +x "$HOME/tools/N_m3u8DL-RE"
+          fi
+          if [ ! -x "$HOME/tools/ffmpeg" ]; then
+            curl -sL -o /tmp/ff.tar.xz "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+            tar xJf /tmp/ff.tar.xz -C /tmp && cp /tmp/ffmpeg-*-amd64-static/ffmpeg /tmp/ffmpeg-*-amd64-static/ffprobe "$HOME/tools/" && chmod +x "$HOME/tools/ffmpeg" "$HOME/tools/ffprobe"
+          fi
+          echo "$HOME/tools" >> "$GITHUB_PATH"
+          if docker image inspect aiogram/telegram-bot-api:latest >/dev/null 2>&1; then echo IMG=present;
+          elif [ -f "$HOME/docker-cache/tgbotapi.tar" ]; then docker load -i "$HOME/docker-cache/tgbotapi.tar" >/dev/null && echo IMG=cache;
+          else docker pull aiogram/telegram-bot-api:latest && docker save -o "$HOME/docker-cache/tgbotapi.tar" aiogram/telegram-bot-api:latest && echo IMG=pulled; fi
+      - name: Start worker Bot API server
+        run: |
+          docker run -d --name tgbotapi -p 8081:8081 \
+            -e TELEGRAM_API_ID="${{ secrets.TELEGRAM_API_ID }}" \
+            -e TELEGRAM_API_HASH="${{ secrets.TELEGRAM_API_HASH }}" \
+            -e TELEGRAM_LOCAL=1 \
+            aiogram/telegram-bot-api:latest --local >/dev/null
+          for i in $(seq 1 30); do
+            curl -s -o /dev/null "http://127.0.0.1:8081/bot${{ secrets.TG_W2_TOKEN }}/getMe" && break
+            sleep 2
+          done
+          echo WORKER_API_READY
+      - name: Run worker (up to 290 min)
+        timeout-minutes: 295
+        run: |
+          export PATH="$HOME/tools:$PATH"
+          SECS=$((${{ inputs.runtime_minutes }} * 60))
+          REPO_DIR="$PWD" WORKER_NAME=w2 WORKER_TOKEN="${{ secrets.TG_W2_TOKEN }}" \
+          CHANNEL_ID="${{ env.CHANNEL_ID }}" \
+          timeout ${SECS}s python3 farm/worker.py | tee worker-w2.log
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop tgbotapi 2>/dev/null || true; docker rm tgbotapi 2>/dev/null || true
+          rm -rf /tmp/farm_* /tmp/apiurl
+
+  w3:
+    name: Worker 03 (Runner 04)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Restore tools cache
+        uses: actions/cache@v4
+        with:
+          path: ~/tools
+          key: Linux-tools-nm3u8dlre-ffmpegstatic-v2
+          restore-keys: |
+            Linux-tools-
+      - name: Restore Bot API image cache
+        uses: actions/cache@v4
+        with:
+          path: ~/docker-cache
+          key: Linux-docker-tgbotapi-v1
+          restore-keys: |
+            Linux-docker-tgbotapi-
+      - name: Setup tools + image
+        run: |
+          mkdir -p ~/tools ~/docker-cache
+          if [ ! -x "$HOME/tools/N_m3u8DL-RE" ]; then
+            ASSET=$(curl -sL https://api.github.com/repos/nilaoda/N_m3u8DL-RE/releases/latest \
+              | jq -r '.assets[] | select(.name | test("linux-x64.*\\.tar\\.gz$")) | .browser_download_url' | head -1)
+            curl -sL -o /tmp/nm.tar.gz "$ASSET" && tar xzf /tmp/nm.tar.gz -C "$HOME/tools" && chmod +x "$HOME/tools/N_m3u8DL-RE"
+          fi
+          if [ ! -x "$HOME/tools/ffmpeg" ]; then
+            curl -sL -o /tmp/ff.tar.xz "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+            tar xJf /tmp/ff.tar.xz -C /tmp && cp /tmp/ffmpeg-*-amd64-static/ffmpeg /tmp/ffmpeg-*-amd64-static/ffprobe "$HOME/tools/" && chmod +x "$HOME/tools/ffmpeg" "$HOME/tools/ffprobe"
+          fi
+          echo "$HOME/tools" >> "$GITHUB_PATH"
+          if docker image inspect aiogram/telegram-bot-api:latest >/dev/null 2>&1; then echo IMG=present;
+          elif [ -f "$HOME/docker-cache/tgbotapi.tar" ]; then docker load -i "$HOME/docker-cache/tgbotapi.tar" >/dev/null && echo IMG=cache;
+          else docker pull aiogram/telegram-bot-api:latest && docker save -o "$HOME/docker-cache/tgbotapi.tar" aiogram/telegram-bot-api:latest && echo IMG=pulled; fi
+      - name: Start worker Bot API server
+        run: |
+          docker run -d --name tgbotapi -p 8081:8081 \
+            -e TELEGRAM_API_ID="${{ secrets.TELEGRAM_API_ID }}" \
+            -e TELEGRAM_API_HASH="${{ secrets.TELEGRAM_API_HASH }}" \
+            -e TELEGRAM_LOCAL=1 \
+            aiogram/telegram-bot-api:latest --local >/dev/null
+          for i in $(seq 1 30); do
+            curl -s -o /dev/null "http://127.0.0.1:8081/bot${{ secrets.TG_W3_TOKEN }}/getMe" && break
+            sleep 2
+          done
+          echo WORKER_API_READY
+      - name: Run worker (up to 290 min)
+        timeout-minutes: 295
+        run: |
+          export PATH="$HOME/tools:$PATH"
+          SECS=$((${{ inputs.runtime_minutes }} * 60))
+          REPO_DIR="$PWD" WORKER_NAME=w3 WORKER_TOKEN="${{ secrets.TG_W3_TOKEN }}" \
+          CHANNEL_ID="${{ env.CHANNEL_ID }}" \
+          timeout ${SECS}s python3 farm/worker.py | tee worker-w3.log
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop tgbotapi 2>/dev/null || true; docker rm tgbotapi 2>/dev/null || true
+          rm -rf /tmp/farm_* /tmp/apiurl
+
+  w4:
+    name: Worker 04 (Runner 05)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Restore tools cache
+        uses: actions/cache@v4
+        with:
+          path: ~/tools
+          key: Linux-tools-nm3u8dlre-ffmpegstatic-v2
+          restore-keys: |
+            Linux-tools-
+      - name: Restore Bot API image cache
+        uses: actions/cache@v4
+        with:
+          path: ~/docker-cache
+          key: Linux-docker-tgbotapi-v1
+          restore-keys: |
+            Linux-docker-tgbotapi-
+      - name: Setup tools + image
+        run: |
+          mkdir -p ~/tools ~/docker-cache
+          if [ ! -x "$HOME/tools/N_m3u8DL-RE" ]; then
+            ASSET=$(curl -sL https://api.github.com/repos/nilaoda/N_m3u8DL-RE/releases/latest \
+              | jq -r '.assets[] | select(.name | test("linux-x64.*\\.tar\\.gz$")) | .browser_download_url' | head -1)
+            curl -sL -o /tmp/nm.tar.gz "$ASSET" && tar xzf /tmp/nm.tar.gz -C "$HOME/tools" && chmod +x "$HOME/tools/N_m3u8DL-RE"
+          fi
+          if [ ! -x "$HOME/tools/ffmpeg" ]; then
+            curl -sL -o /tmp/ff.tar.xz "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+            tar xJf /tmp/ff.tar.xz -C /tmp && cp /tmp/ffmpeg-*-amd64-static/ffmpeg /tmp/ffmpeg-*-amd64-static/ffprobe "$HOME/tools/" && chmod +x "$HOME/tools/ffmpeg" "$HOME/tools/ffprobe"
+          fi
+          echo "$HOME/tools" >> "$GITHUB_PATH"
+          if docker image inspect aiogram/telegram-bot-api:latest >/dev/null 2>&1; then echo IMG=present;
+          elif [ -f "$HOME/docker-cache/tgbotapi.tar" ]; then docker load -i "$HOME/docker-cache/tgbotapi.tar" >/dev/null && echo IMG=cache;
+          else docker pull aiogram/telegram-bot-api:latest && docker save -o "$HOME/docker-cache/tgbotapi.tar" aiogram/telegram-bot-api:latest && echo IMG=pulled; fi
+      - name: Start worker Bot API server
+        run: |
+          docker run -d --name tgbotapi -p 8081:8081 \
+            -e TELEGRAM_API_ID="${{ secrets.TELEGRAM_API_ID }}" \
+            -e TELEGRAM_API_HASH="${{ secrets.TELEGRAM_API_HASH }}" \
+            -e TELEGRAM_LOCAL=1 \
+            aiogram/telegram-bot-api:latest --local >/dev/null
+          for i in $(seq 1 30); do
+            curl -s -o /dev/null "http://127.0.0.1:8081/bot${{ secrets.TG_W4_TOKEN }}/getMe" && break
+            sleep 2
+          done
+          echo WORKER_API_READY
+      - name: Run worker (up to 290 min)
+        timeout-minutes: 295
+        run: |
+          export PATH="$HOME/tools:$PATH"
+          SECS=$((${{ inputs.runtime_minutes }} * 60))
+          REPO_DIR="$PWD" WORKER_NAME=w4 WORKER_TOKEN="${{ secrets.TG_W4_TOKEN }}" \
+          CHANNEL_ID="${{ env.CHANNEL_ID }}" \
+          timeout ${SECS}s python3 farm/worker.py | tee worker-w4.log
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop tgbotapi 2>/dev/null || true; docker rm tgbotapi 2>/dev/null || true
+          rm -rf /tmp/farm_* /tmp/apiurl
+
+  cycle:
+    name: Next cycle (self-retrigger)
+    runs-on: ubuntu-latest
+    needs: [main, w1, w2, w3, w4]
+    # لا توليد عند الإلغاء اليدوي (وإلا أصبح الإلغاء مستحيلاً)، ولا عند تعطيل auto_cycle
+    if: >-
+      always() && inputs.auto_cycle == true &&
+      needs.main.result != 'cancelled' && needs.w1.result != 'cancelled' &&
+      needs.w2.result != 'cancelled' && needs.w3.result != 'cancelled' &&
+      needs.w4.result != 'cancelled'
+    steps:
+      - name: Trigger next cycle
+        run: gh workflow run faselhd-farm.yml --ref main -R ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ github.token }}
